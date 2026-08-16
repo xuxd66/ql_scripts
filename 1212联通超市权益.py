@@ -1,0 +1,742 @@
+# 账号变量 Chinaunicom = 手机号#online_token#appid
+
+import os
+import io
+import re
+import sys
+import time
+import json
+import base64
+import random
+import logging
+import binascii
+import requests
+import threading
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from typing import Optional
+from notify import send
+from threading import Event
+from collections import deque
+from datetime import datetime
+from datetime import datetime, timedelta
+from prettytable import PrettyTable
+from typing import List, Optional
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad
+from urllib.parse import urlparse, parse_qs
+from requests.exceptions import ReadTimeout
+from requests.exceptions import RequestException, ConnectionError, Timeout, HTTPError
+from urllib3.exceptions import NameResolutionError, NewConnectionError
+from requests.exceptions import RequestException, HTTPError
+from urllib3.exceptions import NewConnectionError, MaxRetryError, NameResolutionError
+
+GrantPrize = True # 权益超市自动领奖：启用True/禁用False
+
+#=================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(message)s'
+)
+
+class MillisecondFormatter(logging.Formatter):
+    def formatTime(self, record, datefmt=None):
+        if datefmt is None:
+            datefmt = "%Y-%m-%d %H:%M:%S.%f"
+        dt = datetime.fromtimestamp(record.created)
+        s = dt.strftime(datefmt)
+        return s[:-3]  # 毫秒精度
+
+# 应用毫秒格式到控制台 handler
+console_handler = logging.getLogger().handlers[0]
+console_handler.setFormatter(MillisecondFormatter('[%(asctime)s] %(message)s'))
+
+# 线程安全封装打印
+def log_with_time(message: str, proxy: Optional[str] = None):
+    if proxy:
+        message = f"[代理：{proxy}] {message}"
+    logging.info(message)
+
+shared_session = requests.Session()
+adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=Retry(total=3, backoff_factor=0.3))
+shared_session.mount("http://", adapter)
+shared_session.mount("https://", adapter)
+
+# 代理类
+class ProxyManager:
+    def __init__(self, get_proxy_func, limit=10):
+        self.get_proxy_func = get_proxy_func
+        self.limit = limit
+        self.request_count = 0
+        self.current_proxy = self.get_proxy_func()
+        self.lock = threading.Lock()
+        self.recent_proxies = deque(maxlen=5)
+
+    def get_proxy(self):
+        with self.lock:
+            if self.current_proxy is None:
+                return None
+
+            if self.request_count >= self.limit:
+                self.switch_proxy()
+
+            proxy_to_use = self.current_proxy
+            self.request_count += 1
+
+            return {"http": f"http://{proxy_to_use}", "https": f"http://{proxy_to_use}"}
+
+    def switch_proxy(self):
+        old = self.current_proxy
+        new_proxy = None
+
+        for _ in range(5):
+            candidate = self.get_proxy_func()
+            if candidate and candidate not in self.recent_proxies:
+                new_proxy = candidate
+                break
+            time.sleep(0.1)
+
+        if not new_proxy:
+            new_proxy = self.get_proxy_func()
+
+        self.recent_proxies.append(new_proxy)
+        self.current_proxy = new_proxy
+        self.request_count = 0
+        if self.current_proxy:
+            log_with_time(f"🔁 切换代理：{old} ➡️ {self.current_proxy}")
+        
+# 提取代理IP
+def get_proxyIP(max_retries=3):
+    proxy_url = os.getenv("ProxyIP")
+    if not proxy_url:
+        return None
+
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(proxy_url, timeout=5)
+            proxy_ip = response.text.strip()
+            if re.match(r'^\d+\.\d+\.\d+\.\d+:\d+$', proxy_ip):
+                return proxy_ip
+
+            res = response.json()
+            if res.get('code') == -1:
+                print(f"[代理异常] {res.get('message', '未知错误')}")
+                return None
+
+        except Exception as e:
+            print(f"[提取代理失败] 第 {attempt + 1} 次重试: {e}")
+            time.sleep(1)
+    return None
+    
+class ChinaunicomAPI:
+    def __init__(self, account_list: List[str]):
+        self.GrantPrize = GrantPrize
+        self.phone_list =  []
+        self.online: List[bool] = []
+        self.appid: List[Optional[str]] = []
+        self.user_data: List[Optional[dict]] = []
+        self.proxies = {}
+        self.success_accounts = 0  # 成功处理的账号数
+        self.failed_accounts = 0   # 失败的账号数
+        self.total_prizes = []     # 获得的奖品列表
+        
+        # 初始化开始提示
+        print("\n" + "="*60)
+        print("📱 中国联通权益超市自动化脚本")
+        print("="*60)
+        
+        for entry in account_list:
+            entry = entry.strip()
+            if not entry:
+                continue
+
+            parts = entry.split('#')
+            if len(parts) == 1:
+                self.phone_list.append(parts[0])
+                self.online.append(False)
+                self.appid.append(None)
+            elif len(parts) == 3:
+                self.phone_list.append(parts[0])
+                self.online.append(parts[1])
+                self.appid.append(parts[2])
+
+        for phone in self.phone_list:
+            masked_phone = f"{phone[:3]}****{phone[-4:]}"
+            self.proxies[masked_phone] = ProxyManager(get_proxyIP)
+        
+        # 显示配置信息
+        print(f"\n⚙️  当前配置：")
+        print(f"   ├─ 自动领奖功能: {'✅ 启用' if self.GrantPrize else '❌ 禁用'}")
+        print(f"   ├─ 代理配置: {'✅ 已配置' if os.getenv('ProxyIP') else '❌ 未配置'}")
+        print(f"   └─ 账号总数: {len(self.phone_list)} 个")
+        
+        # 筛选有效账号
+        self.valid_accounts = [(phone, online, appid) for phone, online, appid in 
+                             zip(self.phone_list, self.online, self.appid) if online and appid]
+        print(f"\n🎯 有效权益超市账号: {len(self.valid_accounts)} 个")
+        print("="*60 + "\n")
+
+    # 请求头封装
+    def get_headers(self, Isheaders=None):
+        if Isheaders == 1:
+            headers={
+                "User-Agent": "Mozilla/5.0 (Linux; Android 11; Redmi Note 10 Pro Build/RP1A.201005.004; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/92.0.4515.159 Mobile Safari/537.36",
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Encoding": "gzip, deflate, br, zstd",
+                "Pragma": "no-cache",
+                "Cache-Control": "no-cache",
+                "sec-ch-ua": '"Android WebView";v="123", "Not:A-Brand";v="8", "Chromium";v="123"',
+                "accesstoken": "ODZERTZCMjA1NTg1MTFFNDNFMThDRDYw",
+                "Content-Type": "application/json;charset=UTF-8",
+                "Origin": "https://10010.woread.com.cn",
+                "X-Requested-With": "com.sinovatech.unicom.ui",
+                "Referer": "https://10010.woread.com.cn/ng_woread/",
+                "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7"
+            }
+        elif Isheaders == 2:
+            headers={
+                'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 12; leijun Pro Build/SKQ1.22013.001);unicom{version:android@11.0702}",
+                'Connection': "Keep-Alive",
+                'Accept-Encoding': "gzip"
+            }
+
+        return headers
+
+    # 请求封装
+    def do_send(self, url: str, method: str = "GET", data: Optional[dict] = None, headers: Optional[dict] = None, timeout: float = 10, max_retries: int = 3, show_resp: bool = False, proxy_manager: Optional[ProxyManager] = None, allow_redirects: bool = True) -> requests.Response:
+        for attempt in range(1, max_retries + 1):
+            try:
+                proxies = proxy_manager.get_proxy() if proxy_manager else None
+                if method.upper() == "GET":
+                    if data:
+                        params = data
+                        resp = shared_session.get(url, params=params, headers=headers, timeout=timeout, proxies=proxies, allow_redirects=allow_redirects)
+                    else:
+                        resp = shared_session.get(url, headers=headers, timeout=timeout, proxies=proxies, allow_redirects=allow_redirects)
+                
+                else:
+                    if data and isinstance(data, dict):
+                        if "token_online" in data:
+                            resp = shared_session.request(method=method.upper(), url=url, data=data, headers=headers, timeout=timeout, proxies=proxies, allow_redirects=allow_redirects)
+                        else:
+                            resp = shared_session.request(method=method.upper(), url=url, json=data, headers=headers, timeout=timeout, proxies=proxies, allow_redirects=allow_redirects)
+                    else:
+                        resp = shared_session.request(method=method.upper(), url=url, headers=headers, timeout=timeout, proxies=proxies, allow_redirects=allow_redirects)
+
+                if show_resp:
+                    print(f"[Response][{resp.status_code}] {resp.text}")
+
+                resp.raise_for_status()
+                if resp.status_code == 302:
+                    return resp
+                else:
+                    return resp.json()
+            
+            except requests.exceptions.HTTPError as e:
+                raise
+
+            except ConnectionError as e:
+                if isinstance(e.args[0], NewConnectionError):
+                    print(f"🔴 ：无法建立新连接: {e.args[0]}")
+                    print(f"🔴 连接失败，第{attempt}次重试")
+
+            except requests.exceptions.ConnectionError as e:
+                if hasattr(e, 'args') and len(e.args) > 0 and isinstance(e.args[0], NameResolutionError):
+                    print(f"🔴 DNS解析失败: 第{attempt}次重试")
+
+            except ReadTimeout as e:
+                print(f"🔴 请求超时，第{attempt}次重试")
+
+            except requests.exceptions.RequestException as e:
+                print(f"🔴 请求失败，第{attempt} 次重试: {e}")
+                if attempt == max_retries:
+                    print("🔴 已达最大重试次数")
+                    raise
+
+    # 登录
+    def login(self, phone: str, masked_phone: str, scene: str = "readzone", token_online: str = None, appid: str = None):
+        print(f"\n🔐 正在登录账号 {masked_phone}...")
+        try:
+            if scene == "readzone":
+                pass
+            elif scene == "market":
+                if self.online and self.appid:
+                    url = "https://m.client.10010.com/mobileService/onLine.htm"
+                    headers = self.get_headers(Isheaders=2)
+                    data = {
+                        "isFirstInstall": "1",
+                        "reqtime": str(int(time.time() * 1000)),
+                        "netWay": "Wifi",
+                        "version": "android@11.0000",
+                        "token_online": token_online,
+                        "provinceChanel": "general",
+                        "appId": appid,
+                        "deviceModel": "23013RK75C",
+                        "step": "welcom",
+                        "androidId": "caaa7b5f2b58b3eb",
+                        "deviceBrand": "Xiaomi",
+                        "flushkey": "1"
+                    }
+                    resp = self.do_send(url, method="POST", data=data, headers=headers, show_resp=False)
+                    ecs_token = resp.get("ecs_token")
+                    if ecs_token:
+                        print(f"✅ {masked_phone} 登录成功")
+                        return ecs_token
+                    else:
+                        print(f"❌ {masked_phone} 登录失败：未获取到ecs_token")
+
+        except Exception as e:
+            print(f"❌ {masked_phone}登录异常: {str(e)}")
+            return None 
+
+    # 获取Ticket
+    def get_ticket(self):
+        print("🔍 正在获取Ticket凭证...")
+        url = "https://m.client.10010.com/mobileService/openPlatform/openPlatLineNew.htm?to_url=https://contact.bol.wo.cn/market"
+        headers = self.get_headers(Isheaders=2)
+        try:
+            resp = self.do_send(url, method="GET", headers=headers, allow_redirects=False, show_resp=False)
+            if resp.status_code == 302:
+                location = resp.headers.get("Location", "")
+                parsed_url = urlparse(location)
+                query_params = parse_qs(parsed_url.query)
+                ticket_list = query_params.get("ticket")
+                ticket = ticket_list[0] if ticket_list else None
+                if ticket:
+                    print(f"✅ Ticket获取成功: {ticket[:20]}...")
+                    return ticket
+                else:
+                    print("❌ Ticket获取失败：未在跳转链接中找到ticket参数")
+
+        except Exception as e:
+            print(f"❌ 获取Ticket异常: {str(e)}")
+            return None
+    
+    def get_userToken(self, ticket):
+        print("🔑 正在获取用户Token...")
+        url = f"https://backward.bol.wo.cn/prod-api/auth/marketUnicomLogin?ticket={ticket}"
+        headers = self.get_headers(Isheaders=2)
+        try:
+            resp = self.do_send(url, method="POST", headers=headers, show_resp=False)
+            userToken = resp.get("data", {}).get("token")
+            if userToken:
+                print(f"✅ 用户Token获取成功: {userToken[:20]}...")
+                return userToken
+            else:
+                print(f"❌ 用户Token获取失败: {resp}")
+        
+        except Exception as e:
+            print(f"❌ 获取userToken异常: {str(e)}")
+            return None
+    
+    # 权益超市&任务列表
+    def get_AllActivityTasks(self, ecs_token, userToken):
+        print("📋 正在查询权益超市任务列表...")
+        url = "https://backward.bol.wo.cn/prod-api/promotion/activityTask/getAllActivityTasks?activityId=12"
+        headers = self.get_headers(Isheaders=2)
+        headers['Cookie'] = 'ecs_token='+ ecs_token
+        headers['Authorization'] = 'Bearer '+ userToken
+        shareList = []
+        try:
+            resp = self.do_send(url, method="GET", headers=headers, show_resp=False)
+            active_id_listarr = resp.get("data", {})
+            task_count = len(active_id_listarr.get("activityTaskUserDetailVOList", []))
+            print(f"📌 共查询到 {task_count} 个任务")
+            
+            for item in active_id_listarr.get("activityTaskUserDetailVOList", []):
+                share_info = {
+                    "param": item.get("param1"),
+                    "activityId": item.get("activityId"),
+                    "name": item.get("name"),
+                    "triggerTime": item.get("triggerTime"),
+                    "triggeredTime": item.get("triggeredTime")
+                }
+                shareList.append(share_info)
+
+            return shareList
+
+        except Exception as e:
+            print(f"❌ 权益超市查询任务异常: {str(e)}")
+            return None
+    
+   # 权益超市&任务执行
+    def do_ShareList(self, shareList, userToken):
+        print("\n🎯 开始执行任务...")
+        completed_tasks = 0
+        skipped_tasks = 0
+        try:
+            for task in shareList:
+                share_name = task.get("name")
+                share_param = task.get("param")
+                target_count = int(task.get("triggerTime", 1))
+                current_count = int(task.get("triggeredTime", 0))
+                
+                if ("购买" in share_name or "秒杀" in share_name):
+                    print(f"🚫 {share_name} [跳过付费任务]")
+                    skipped_tasks += 1
+                    continue
+                if current_count >= target_count:
+                    print(f"✅ {share_name} [任务已完成]")
+                    completed_tasks += 1
+                    continue
+
+                url = ""
+                if share_param:
+                    if "浏览" in share_name or "查看" in share_name:
+                        url = f"https://backward.bol.wo.cn/prod-api/promotion/activityTaskShare/checkView?checkKey={share_param}"
+                    elif "分享" in share_name:
+                        url = f"https://backward.bol.wo.cn/prod-api/promotion/activityTaskShare/checkShare?checkKey={share_param}"
+
+                if url:
+                    headers = self.get_headers(Isheaders=2)
+                    headers['Authorization'] = 'Bearer '+ userToken
+                    resp = self.do_send(url, method="POST", headers=headers, show_resp=False)
+                    if resp and resp.get("code") == 200:
+                        print(f"✅ {share_name} 执行成功")
+                        completed_tasks += 1
+                    else:
+                        print(f"❌ {share_name} 执行失败: {resp}")
+            
+            print(f"\n📊 任务执行统计: 完成 {completed_tasks} | 跳过 {skipped_tasks} | 总计 {len(shareList)}")
+
+        except Exception as e:
+            print(f"❌ 权益超市{share_name}执行异常: {str(e)}")
+
+    # 抽奖池子
+    def get_Raffle(self, userToken):
+        print("\n🎰 正在检查抽奖奖品池...")
+        url = "https://backward.bol.wo.cn/prod-api/promotion/home/raffleActivity/prizeList?id=12"
+        headers = self.get_headers(Isheaders=2)
+        headers['Authorization'] = 'Bearer '+ userToken
+        try:
+            resp = self.do_send(url, method="POST", headers=headers, show_resp=False)
+            
+            keywords = ['月卡', '月会员', '月度', 'VIP月', '一个月']
+            live_prizes = []
+            
+            if 'data' in resp and isinstance(resp['data'], list):
+                total_prizes = len(resp['data'])
+                print(f"🎁 奖品池总计 {total_prizes} 个奖品")
+                
+                for prize in resp['data']:
+                    name = prize.get('name', '')
+                    if not any(kw in name for kw in keywords):
+                        continue
+                    try:
+                        daily_limit = int(prize.get('dailyPrizeLimit', 0))
+                        quantity = int(prize.get('quantity', 0))
+                        prob = float(prize.get('probability', 0))
+                    except:
+                        daily_limit = 0
+                        quantity = 0
+                        prob = 0.0
+
+                    if daily_limit > 0 and quantity > 0:
+                        live_prizes.append({
+                            'name': name,
+                            'daily': daily_limit,
+                            'total': quantity,
+                            'prob': prob
+                        })
+            
+            if live_prizes:
+                print("\n🎉 当前已放水！可抽有库存奖品👇")
+                print("-" * 50)
+                for item in live_prizes:
+                    print(f"🎁 {item['name']}")
+                    print(f"   ├─ 今日投放: {item['daily']}")
+                    print(f"   ├─ 总库存: {item['total']}")
+                    print(f"   └─ 中奖概率: {item['prob'] * 100:.1f}%")
+                print("-" * 50)
+                return True
+            else:
+                print("📢 当前未放水！无有效奖品可抽，终止抽奖")
+                return False
+
+        except Exception as e:
+            print(f"❌ 权益超市抽奖查询异常: {str(e)}")
+            return False
+
+    # 权益超市&抽奖次数查询
+    def get_raffle_count(self, userToken):
+        print("\n🎮 正在查询抽奖次数...")
+        url = "https://backward.bol.wo.cn/prod-api/promotion/home/raffleActivity/getUserRaffleCount?id=12"
+        headers = self.get_headers(Isheaders=2)
+        headers['Authorization'] = 'Bearer '+ userToken
+        try:
+            resp = self.do_send(url, method="POST", headers=headers, show_resp=False)
+            count = resp.get("data", 0)
+            print(f"✅ 当前可用抽奖次数：{count}")
+            
+            if count <= 0:
+                print("🎲 暂无抽奖次数，跳过抽奖")
+                return
+                
+            print(f"\n🎡 开始抽奖 (共{count}次)...")
+            success_draws = 0
+            failed_draws = 0
+            
+            while count > 0:
+                draw_num = abs(count - resp.get('data', 0)) + 1
+                print(f"\n🎯 第 {draw_num} 次抽奖")
+                success = self.get_userRaffle(userToken)
+                if success:
+                    success_draws += 1
+                else:
+                    failed_draws += 1
+                    print(f"❌ 第 {draw_num} 次抽奖失败")
+                    
+                count -= 1
+                print(f"🔢 剩余抽奖次数: {count}")
+                # 抽奖间隔，避免风控
+                if count > 0:
+                    time.sleep(random.uniform(0.5, 1.5))
+            
+            print(f"\n🎰 抽奖统计: 成功 {success_draws} | 失败 {failed_draws}")
+
+        except Exception as e:
+            print(f"❌ 权益超市查询抽奖次数异常: {str(e)}")
+    
+    # 权益超市&抽奖
+    def get_userRaffle(self, userToken):
+        url = "https://backward.bol.wo.cn/prod-api/promotion/home/raffleActivity/userRaffle?id=12&channel="
+        headers = self.get_headers(Isheaders=2)
+        headers['Authorization'] = 'Bearer '+ userToken                
+        try:
+            resp = self.do_send(url, method="POST", headers=headers, show_resp=False)
+            if resp.get("code") == 200:
+                if resp.get("data"):
+                    lotteryRecordId = resp.get("data").get("lotteryRecordId")
+                    prizesName = resp.get("data").get("prizesName")
+                    message = resp.get("data").get("message")
+                    
+                    if prizesName:
+                        print(f"🏆 恭喜抽中: {prizesName}")
+                        self.total_prizes.append(prizesName)
+                    else:
+                        print(f"🎫 抽奖结果: {message}")
+                    
+                    if self.GrantPrize and lotteryRecordId:
+                        print(f"🎁 自动领奖中...")
+                        self.get_grantPrize(userToken, lotteryRecordId, prizesName or message)
+
+                    return True
+            elif resp.get("code") == 500:
+                print("⚠️ 触发人机验证，自动验证中...")
+                return self.get_validateCaptcha(userToken)
+            else:
+                print(f"❌ 抽奖失败: {resp.get('message', '未知错误')}")
+
+        except Exception as e:
+            print(f"❌ 权益超市抽奖异常: {str(e)}")
+            return False
+
+    # 权益超市&人机验证
+    def get_validateCaptcha(self, userToken):
+        url = "https://backward.bol.wo.cn/prod-api/promotion/home/raffleActivity/validateCaptcha?id=12"
+        headers = self.get_headers(Isheaders=2)
+        headers['Authorization'] = 'Bearer '+ userToken
+        try:
+            resp = self.do_send(url, method="POST", headers=headers, show_resp=False)
+            if resp.get("code") == 200:
+                print("✅ 人机验证通过，继续抽奖")
+                return self.get_userRaffle(userToken)
+            else:
+                print(f"❌ 人机验证失败: {resp}")
+                return False
+
+        except Exception as e:
+            print(f"❌ 权益超市人机验证异常: {str(e)}")
+            return False
+    
+    # 待领奖品
+    def get_MyPrize(self, userToken):
+        print("\n📦 正在查询待领取奖品...")
+        url = "https://backward.bol.wo.cn/prod-api/promotion/home/raffleActivity/getMyPrize"
+        headers = self.get_headers(Isheaders=2)
+        headers['Authorization'] = 'Bearer '+ userToken
+        data ={
+            "id": 12,
+            "type": 0,
+            "page": 1,
+            "limit": 100
+        }
+        try:
+            resp = self.do_send(url, method="POST", data=data, headers=headers, show_resp=False)
+            lists = resp.get("data", {}).get("list", [])
+            
+            if not lists:
+                print("📭 暂无待领取奖品")
+                return None
+                
+            table = PrettyTable()
+            lottery_record_ids = []
+            
+            table.title = f"待领取奖品列表 ({len(lists)}个)"
+            table.field_names = ["商品名称", "奖品ID", "获得时间", "失效时间"]
+            table.align = "l"  # 左对齐
+            
+            for item in lists:
+                lotteryRecordId = item.get("id")
+                prizesName = item.get("prizesName")
+                createTime = item.get("createTime")
+                deadline = item.get("deadline")
+                
+                table.add_row([prizesName, lotteryRecordId, createTime, deadline])
+                lottery_record_ids.append((lotteryRecordId, prizesName))
+            
+            print(table)
+
+            if self.GrantPrize and lottery_record_ids:
+                print(f"\n🎁 开始自动领取奖品...")
+                success_grant = 0
+                for lottery_id, prizesName in lottery_record_ids:
+                    if self.get_grantPrize(userToken, lottery_id, prizesName):
+                        success_grant += 1
+                
+                print(f"🎊 领奖完成: 成功领取 {success_grant}/{len(lottery_record_ids)} 个奖品")
+
+        except Exception as e:
+            print(f"❌ 权益超市待领奖品查询异常: {str(e)}")
+            return None
+
+    # 权益超市&领奖
+    def get_grantPrize(self, userToken, lotteryRecordId, prizesName):
+        url = "https://backward.bol.wo.cn/prod-api/promotion/home/raffleActivity/grantPrize?activityId=12"
+        headers = self.get_headers(Isheaders=2)
+        headers['Accept'] = "application/json, text/plain, */*"
+        headers['Accept-Encoding'] = "gzip, deflate, br, zstd"
+        headers['Content-Type'] =  "application/json"
+        headers['Authorization'] = 'Bearer '+ userToken
+        data ={
+            "recordId": lotteryRecordId
+        }
+        try:
+            resp = self.do_send(url, method="POST", data=data, headers=headers, show_resp=False)
+            if resp.get("code") == 200:
+                print(f"✅ 成功领取: {prizesName}")
+                return True
+            else:
+                print(f"❌ 领取失败: {prizesName} - {resp.get('message', '未知错误')}")
+
+        except Exception as e:
+            print(f"❌ 权益超市领奖异常: {str(e)}")
+        
+        return False
+    
+    def QYCS_task(self, phone: str, appid: str):
+        start_time = time.time()
+        index = self.phone_list.index(phone)
+        token_online = self.online[index]
+        masked_phone = f"{phone[:3]}****{phone[-4:]}"
+        
+        print(f"\n" + "="*50)
+        print(f"📱 开始处理账号: {masked_phone}")
+        print("="*50)
+        
+        try:
+            ecs_token = self.login(phone=phone, masked_phone=masked_phone, scene="market", token_online=token_online, appid=appid)
+            if not ecs_token:
+                print(f"❌ {masked_phone} 登录失败，跳过后续操作")
+                self.failed_accounts += 1
+                return
+            
+            ticket = self.get_ticket()
+            if not ticket:
+                print(f"❌ {masked_phone} 获取Ticket失败，跳过后续操作")
+                self.failed_accounts += 1
+                return
+                
+            userToken = self.get_userToken(ticket)
+            if not userToken:
+                print(f"❌ {masked_phone} 获取UserToken失败，跳过后续操作")
+                self.failed_accounts += 1
+                return
+
+            # 执行任务
+            shareList = self.get_AllActivityTasks(ecs_token, userToken)
+            if shareList:
+                self.do_ShareList(shareList, userToken)
+            
+            # 抽奖环节
+            if self.get_Raffle(userToken):
+                self.get_raffle_count(userToken)
+
+            # 奖品领取
+            self.get_MyPrize(userToken)
+            
+            # 统计成功账号
+            self.success_accounts += 1
+            elapsed_time = time.time() - start_time
+            print(f"\n✅ {masked_phone} 处理完成 (耗时: {elapsed_time:.2f}秒)")
+            
+        except Exception as e:
+            print(f"\n❌ {masked_phone} 处理异常: {str(e)}")
+            self.failed_accounts += 1
+
+    # 主程序
+    def TASK(self):
+        start_total_time = time.time()
+        
+        has_qycs_task = len(self.valid_accounts) > 0
+        if not has_qycs_task:
+            print("⚠️ 未检测到有效权益超市账号（需要包含online_token和appid）")
+            return
+        
+        print(f"🚀 开始处理权益超市任务，共 {len(self.valid_accounts)} 个账号")
+        print("="*60)
+        
+        account_num = 1
+        total_accounts = len(self.valid_accounts)
+        
+        for phone, need_sync, appid in self.valid_accounts:
+            print(f"\n[{account_num}/{total_accounts}] 处理进度")
+            self.QYCS_task(phone, appid)
+            account_num += 1
+            
+            # 账号间添加间隔，避免风控
+            if account_num <= total_accounts:
+                sleep_time = random.uniform(2, 5)
+                print(f"\n⏳ 等待 {sleep_time:.1f} 秒后处理下一个账号...")
+                time.sleep(sleep_time)
+        
+        # 总统计
+        total_elapsed = time.time() - start_total_time
+        print("\n" + "="*60)
+        print("📊 任务执行完成 - 总统计")
+        print("="*60)
+        print(f"⏱️  总耗时: {total_elapsed:.2f} 秒")
+        print(f"✅ 成功处理账号: {self.success_accounts} 个")
+        print(f"❌ 失败账号: {self.failed_accounts} 个")
+        
+        if self.total_prizes:
+            print(f"\n🏆 本次获得奖品统计:")
+            prize_counts = {}
+            for prize in self.total_prizes:
+                prize_counts[prize] = prize_counts.get(prize, 0) + 1
+            
+            for prize, count in prize_counts.items():
+                print(f"   🎁 {prize}: {count}个")
+        
+        print("\n🎉 所有任务处理完毕！")
+        print("="*60)
+
+if __name__ == "__main__":
+    # 启动欢迎信息
+    print("="*60)
+    print("🌟 中国联通权益超市自动化脚本 v2.0")
+    print("🕒 启动时间:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    print("="*60)
+    
+    # 读取环境变量
+    raw = os.getenv("Chinaunicom", "").strip()
+    if not raw:
+        print("\n❌ 错误：未检测到 Chinaunicom 环境变量")
+        print("ℹ️  格式要求：手机号#online_token#appid（每行一个账号）")
+        sys.exit(1)
+
+    account_list = [line for line in raw.splitlines() if line.strip()]
+
+    # 初始化API并执行
+    api = ChinaunicomAPI(account_list)
+    api.TASK()
